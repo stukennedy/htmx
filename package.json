@@ -57,9 +57,7 @@
     "brotli-cli": "^2.1.1",
     "chai": "^4.5.0",
     "mocha": "^11.7.4",
-    "terser": "^5.36.0"
-  },
-  "dependencies": {
+    "terser": "^5.36.0",
     "ws": "^8.18.3"
   }
 }

@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTMX WebSocket Audio Extension - Manual Test</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .glass {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+        }
+        .recording {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+        .waveform {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+        }
+        .transcript-item {
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-connected { background-color: #10b981; box-shadow: 0 0 8px #10b981; }
+        .status-disconnected { background-color: #ef4444; }
+        .status-recording { background-color: #f59e0b; animation: pulse 1s infinite; }
+        
+        .audio-level-bar {
+            height: 4px;
+            background: linear-gradient(90deg, #10b981 0%, #f59e0b 50%, #ef4444 100%);
+            transition: width 0.1s ease;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-6xl mx-auto">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-5xl font-bold text-white mb-4">🎙️ WebSocket Audio Test</h1>
+            <p class="text-white text-lg opacity-90">Real-time audio streaming with HTMX WebSocket Extension</p>
+        </div>
+
+        <!-- Main Audio Interface -->
+        <div id="audio-container"
+             hx-ws:connect="ws://localhost:3001/audio" 
+             hx-ws:audio
+             hx-ws:audio-sample-rate="16000"
+             hx-trigger="load"
+             hx-target="#transcript"
+             hx-swap="beforeend"
+             class="glass rounded-2xl p-8 mb-6">
+            
+            <!-- Connection Status -->
+            <div class="mb-6 flex items-center justify-between">
+                <div class="flex items-center">
+                    <span id="connection-status" class="status-indicator status-disconnected"></span>
+                    <span id="connection-text" class="text-white font-medium">Not Connected</span>
+                </div>
+                <div class="text-white text-sm opacity-75" id="latency">Latency: --ms</div>
+            </div>
+
+            <!-- Audio Controls -->
+            <div class="mb-6">
+                <!-- Initialize Button (shown first) -->
+                <div id="init-controls" class="mb-4">
+                    <button id="init-audio-btn"
+                            class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-6 px-6 rounded-xl transition-all transform hover:scale-105 active:scale-95 shadow-lg text-lg">
+                        🎙️ Initialize Audio & Request Permissions
+                    </button>
+                </div>
+                
+                <!-- Recording Controls (hidden until initialized) -->
+                <div id="recording-controls" class="hidden gap-4">
+                    <button hx-ws:audio-start 
+                            class="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-4 px-6 rounded-xl transition-all transform hover:scale-105 active:scale-95 shadow-lg">
+                        🎤 Start Recording
+                    </button>
+                    <button hx-ws:audio-stop 
+                            class="flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-4 px-6 rounded-xl transition-all transform hover:scale-105 active:scale-95 shadow-lg">
+                        ⏹️ Stop Recording
+                    </button>
+                    <button hx-ws:audio-interrupt 
+                            class="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-4 px-6 rounded-xl transition-all transform hover:scale-105 active:scale-95 shadow-lg">
+                        ✋ Interrupt
+                    </button>
+                </div>
+            </div>
+
+            <!-- Visualizer -->
+            <div class="mb-6">
+                <h3 class="text-white font-bold mb-3">Audio Waveform</h3>
+                <canvas hx-ws:audio-visualizer 
+                        class="w-full waveform" 
+                        width="800" 
+                        height="100"></canvas>
+            </div>
+
+            <!-- Audio Level Meter -->
+            <div class="mb-6">
+                <h3 class="text-white font-bold mb-3">Audio Level</h3>
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="flex items-center gap-3">
+                        <span class="text-white text-sm font-mono min-w-[60px]" hx-ws:audio-level>0 dB</span>
+                        <div class="flex-1 bg-gray-700 rounded-full h-4 overflow-hidden">
+                            <div id="level-bar" class="audio-level-bar h-full" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recording Status -->
+            <div id="recording-status" class="text-center text-white text-sm opacity-75 mb-4">
+                Click "Initialize Audio" to begin
+            </div>
+        </div>
+
+        <!-- Transcript Panel -->
+        <div class="glass rounded-2xl p-8 mb-6">
+            <h2 class="text-2xl font-bold text-white mb-4">📝 Transcript</h2>
+            <div id="transcript" 
+                 class="bg-black bg-opacity-20 rounded-xl p-4 min-h-[300px] max-h-[500px] overflow-y-auto"
+                 style="scroll-behavior: smooth;">
+                <div id="transcript-placeholder" class="text-white text-center opacity-50 py-8">
+                    Transcript will appear here...
+                </div>
+            </div>
+        </div>
+
+        <!-- Stats & Info -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+            <!-- Audio Stats -->
+            <div class="glass rounded-xl p-6">
+                <h3 class="text-white font-bold mb-3">📊 Audio Stats</h3>
+                <div class="space-y-2 text-white text-sm">
+                    <div>Sample Rate: <span id="sample-rate" class="font-mono">16000 Hz</span></div>
+                    <div>Chunks Sent: <span id="chunks-sent" class="font-mono">0</span></div>
+                    <div>Duration: <span id="duration" class="font-mono">0:00</span></div>
+                </div>
+            </div>
+
+            <!-- Response Stats -->
+            <div class="glass rounded-xl p-6">
+                <h3 class="text-white font-bold mb-3">💬 Response Stats</h3>
+                <div class="space-y-2 text-white text-sm">
+                    <div>Messages: <span id="msg-count" class="font-mono">0</span></div>
+                    <div>Words: <span id="word-count" class="font-mono">0</span></div>
+                    <div>Avg Latency: <span id="avg-latency" class="font-mono">--ms</span></div>
+                </div>
+            </div>
+
+            <!-- Connection Info -->
+            <div class="glass rounded-xl p-6">
+                <h3 class="text-white font-bold mb-3">🔌 Connection</h3>
+                <div class="space-y-2 text-white text-sm">
+                    <div>Protocol: <span class="font-mono">WebSocket</span></div>
+                    <div>Endpoint: <span class="font-mono">/audio</span></div>
+                    <div>State: <span id="ws-state" class="font-mono">NOT CONNECTED</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Event Log -->
+        <div class="glass rounded-2xl p-8">
+            <h2 class="text-2xl font-bold text-white mb-4">📋 Event Log</h2>
+            <div id="event-log" 
+                 class="bg-black bg-opacity-20 rounded-xl p-4 max-h-[300px] overflow-y-auto font-mono text-xs text-white"
+                 style="scroll-behavior: smooth;">
+            </div>
+        </div>
+    </div>
+
+    <!-- Load HTMX and Extensions -->
+    <script src="/dist/htmx.js"></script>
+    <script src="/src/ext/hx-ws.js"></script>
+    <script src="https://unpkg.com/chatdio@latest/dist/browser.global.js"></script>
+    <script src="/src/ext/hx-ws-audio.js"></script>
+
+    <script>
+        // Stats tracking
+        let chunksSent = 0;
+        let messageCount = 0;
+        let wordCount = 0;
+        let startTime = null;
+        let latencies = [];
+
+        // Event logging
+        function logEvent(event, detail = '') {
+            const log = document.getElementById('event-log');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'mb-1 opacity-75';
+            entry.innerHTML = `<span class="text-green-400">[${time}]</span> ${event} ${detail}`;
+            log.insertBefore(entry, log.firstChild);
+            
+            // Keep only last 50 entries
+            while (log.children.length > 50) {
+                log.removeChild(log.lastChild);
+            }
+        }
+
+        // Connection events
+        document.body.addEventListener('htmx:after:ws:connect', (e) => {
+            document.getElementById('connection-status').className = 'status-indicator status-connected';
+            document.getElementById('connection-text').textContent = 'Connected';
+            document.getElementById('ws-state').textContent = 'OPEN';
+            logEvent('🟢 WebSocket connected', e.detail.url);
+        });
+
+        document.body.addEventListener('htmx:ws:close', (e) => {
+            document.getElementById('connection-status').className = 'status-indicator status-disconnected';
+            document.getElementById('connection-text').textContent = 'Disconnected';
+            document.getElementById('ws-state').textContent = 'CLOSED';
+            logEvent('🔴 WebSocket closed');
+        });
+
+        document.body.addEventListener('htmx:ws:error', (e) => {
+            logEvent('❌ WebSocket error', JSON.stringify(e.detail.error));
+        });
+
+        // Audio events
+        document.body.addEventListener('htmx:ws:audio:start', (e) => {
+            document.getElementById('connection-status').className = 'status-indicator status-recording';
+            document.getElementById('recording-status').innerHTML = '🔴 <span class="recording">Recording in progress...</span>';
+            startTime = Date.now();
+            chunksSent = 0;
+            logEvent('🎤 Recording started');
+        });
+
+        document.body.addEventListener('htmx:ws:audio:stop', (e) => {
+            document.getElementById('connection-status').className = 'status-indicator status-connected';
+            document.getElementById('recording-status').textContent = 'Ready to record';
+            startTime = null;
+            logEvent('⏹️ Recording stopped');
+        });
+
+        document.body.addEventListener('htmx:ws:audio:interrupt', (e) => {
+            document.getElementById('connection-status').className = 'status-indicator status-connected';
+            logEvent('✋ Recording interrupted');
+        });
+
+        document.body.addEventListener('htmx:ws:audio:chunk', (e) => {
+            chunksSent++;
+            document.getElementById('chunks-sent').textContent = chunksSent;
+            
+            // Log first few chunks
+            if (chunksSent <= 3) {
+                console.log('Audio chunk event:', e.detail);
+            }
+            
+            // Update duration
+            if (startTime) {
+                const duration = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(duration / 60);
+                const secs = duration % 60;
+                document.getElementById('duration').textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+            }
+        });
+
+        document.body.addEventListener('htmx:ws:audio:level', (e) => {
+            const level = e.detail.level || 0;
+            const percentage = Math.min(Math.max((level + 100) / 100 * 100, 0), 100);
+            document.getElementById('level-bar').style.width = percentage + '%';
+        });
+
+        // Message events
+        document.body.addEventListener('htmx:after:ws:message', (e) => {
+            const envelope = e.detail.envelope;
+            
+            // Remove placeholder on first message
+            const placeholder = document.getElementById('transcript-placeholder');
+            if (placeholder) {
+                placeholder.remove();
+            }
+            
+            if (envelope.channel === 'audio' && envelope.format === 'transcript') {
+                messageCount++;
+                const text = envelope.payload;
+                const words = text.split(/\s+/).filter(w => w.length > 0);
+                wordCount += words.length;
+                
+                document.getElementById('msg-count').textContent = messageCount;
+                document.getElementById('word-count').textContent = wordCount;
+                
+                logEvent('💬 Transcript received', `"${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+            }
+            
+            // Track latency
+            if (envelope.latency) {
+                latencies.push(envelope.latency);
+                if (latencies.length > 10) latencies.shift();
+                const avgLatency = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length);
+                document.getElementById('avg-latency').textContent = avgLatency + 'ms';
+                document.getElementById('latency').textContent = `Latency: ${envelope.latency}ms`;
+            }
+        });
+
+        // Initialize Audio button handler
+        document.getElementById('init-audio-btn').addEventListener('click', async () => {
+            const container = document.getElementById('audio-container');
+            const btn = document.getElementById('init-audio-btn');
+            
+            btn.textContent = '⏳ Requesting permissions...';
+            btn.disabled = true;
+            
+            try {
+                // Request audio permissions and initialize audio
+                htmx.trigger(container, 'htmx:ws:audio:init-request');
+                
+                // Wait for audio ready event
+                await new Promise((resolve, reject) => {
+                    const readyHandler = () => {
+                        container.removeEventListener('htmx:ws:audio:ready', readyHandler);
+                        resolve();
+                    };
+                    const errorHandler = (e) => {
+                        container.removeEventListener('htmx:ws:audio:error', errorHandler);
+                        reject(e.detail.error);
+                    };
+                    container.addEventListener('htmx:ws:audio:ready', readyHandler);
+                    container.addEventListener('htmx:ws:audio:error', errorHandler);
+                    
+                    // Timeout after 10 seconds
+                    setTimeout(() => {
+                        container.removeEventListener('htmx:ws:audio:ready', readyHandler);
+                        container.removeEventListener('htmx:ws:audio:error', errorHandler);
+                        reject('Timeout waiting for audio initialization');
+                    }, 10000);
+                });
+                
+                logEvent('✅ Audio permissions granted');
+                
+                // WebSocket already connected on load, just verify
+                console.log('Container wsUrl:', container._htmx?.wsUrl);
+                
+                // Success - show recording controls
+                document.getElementById('init-controls').classList.add('hidden');
+                const recordingControls = document.getElementById('recording-controls');
+                recordingControls.classList.remove('hidden');
+                recordingControls.classList.add('flex');
+                document.getElementById('recording-status').textContent = 'Ready to record';
+                logEvent('✅ System initialized and ready');
+                
+            } catch (error) {
+                btn.textContent = '❌ Failed - Click to retry';
+                btn.disabled = false;
+                logEvent('❌ Initialization failed', error);
+                alert('Failed to initialize: ' + error);
+            }
+        });
+        
+        // Debug: Listen for wsSendRaw events
+        document.body.addEventListener('htmx:wsSendRaw', (e) => {
+            console.log('htmx:wsSendRaw event fired:', e.detail);
+        });
+        
+        // Initialize
+        logEvent('✨ Page loaded. Click "Initialize Audio" to begin.');
+    </script>
+</body>
+</html>
+

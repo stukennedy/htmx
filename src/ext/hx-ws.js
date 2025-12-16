@@ -27,6 +27,38 @@
     }
     
     // ========================================
+    // URL NORMALIZATION
+    // ========================================
+    
+    function normalizeWebSocketUrl(url) {
+        // Already absolute WebSocket URL
+        if (url.startsWith('ws://') || url.startsWith('wss://')) {
+            return url;
+        }
+        
+        // Absolute HTTP/HTTPS URL - convert to ws(s)://
+        if (url.startsWith('http://')) {
+            return 'ws://' + url.substring(7);
+        }
+        if (url.startsWith('https://')) {
+            return 'wss://' + url.substring(8);
+        }
+        
+        // Relative path - construct from current location
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host;
+        
+        if (url.startsWith('/')) {
+            // Absolute path
+            return `${protocol}//${host}${url}`;
+        } else {
+            // Relative path
+            const basePath = window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/') + 1);
+            return `${protocol}//${host}${basePath}${url}`;
+        }
+    }
+    
+    // ========================================
     // CONFIGURATION
     // ========================================
     
@@ -37,7 +69,8 @@
             reconnectMaxDelay: 30000,
             reconnectJitter: true,
             autoConnect: false,
-            pauseInBackground: true
+            pauseInBackground: true,
+            requestTimeout: 60000  // 60 seconds TTL for pending requests
         };
         return { ...defaults, ...(htmx.config.websockets || {}) };
     }
@@ -65,8 +98,11 @@
             pendingRequests: new Map()
         };
         
-        connectionRegistry.set(url, entry);
-        createWebSocket(url, entry);
+        // Don't add to registry until connection is approved
+        let connected = createWebSocket(url, entry);
+        if (connected) {
+            connectionRegistry.set(url, entry);
+        }
         return entry;
     }
     
@@ -74,7 +110,8 @@
         let firstElement = entry.elements.values().next().value;
         if (firstElement) {
             if (!triggerEvent(firstElement, 'htmx:before:ws:connect', { url })) {
-                return;
+                // Connection cancelled by event handler
+                return false;
             }
         }
         
@@ -82,8 +119,9 @@
             entry.socket = new WebSocket(url);
             
             entry.socket.addEventListener('open', () => {
-                // Don't reset reconnectAttempts immediately - allow backoff to persist across quick reconnections
-                // It will naturally decrease as the connection remains stable
+                // Reset reconnect attempts on successful connection
+                entry.reconnectAttempts = 0;
+                
                 if (firstElement) {
                     triggerEvent(firstElement, 'htmx:after:ws:connect', { url, socket: entry.socket });
                 }
@@ -97,6 +135,9 @@
                 if (firstElement) {
                     triggerEvent(firstElement, 'htmx:ws:close', { url });
                 }
+                
+                // Clear all pending requests on close
+                entry.pendingRequests.clear();
                 
                 // Check if entry is still valid (not cleared)
                 if (!connectionRegistry.has(url)) return;
@@ -114,10 +155,13 @@
                     triggerEvent(firstElement, 'htmx:ws:error', { url, error });
                 }
             });
+            
+            return true;
         } catch (error) {
             if (firstElement) {
                 triggerEvent(firstElement, 'htmx:ws:error', { url, error });
             }
+            return false;
         }
     }
     
@@ -187,9 +231,12 @@
             return;
         }
         
+        // Normalize URL to match how it's stored in registry
+        url = normalizeWebSocketUrl(url);
+        
         let entry = connectionRegistry.get(url);
         if (!entry || !entry.socket || entry.socket.readyState !== WebSocket.OPEN) {
-            triggerEvent(element, 'htmx:wsSendError', { url, error: 'Connection not open' });
+            triggerEvent(element, 'htmx:ws:sendError', { url, error: 'Connection not open' });
             return;
         }
         
@@ -198,18 +245,24 @@
         let body = api.collectFormData(element, form, event.submitter);
         api.handleHxVals(element, body);
         
+        // Convert FormData to object, preserving multi-value fields
         let values = {};
         for (let [key, value] of body) {
-            values[key] = value;
+            if (values.hasOwnProperty(key)) {
+                // Key already exists - convert to array if needed
+                if (!Array.isArray(values[key])) {
+                    values[key] = [values[key]];
+                }
+                values[key].push(value);
+            } else {
+                values[key] = value;
+            }
         }
         
         let requestId = generateUUID();
         let message = {
-            type: 'request',
             request_id: requestId,
-            event: event.type,
-            values: values,
-            path: url
+            values: values
         };
         
         if (element.id) {
@@ -230,7 +283,7 @@
             
             triggerEvent(element, 'htmx:after:ws:send', { message: detail.message, url });
         } catch (error) {
-            triggerEvent(element, 'htmx:wsSendError', { url, error });
+            triggerEvent(element, 'htmx:ws:sendError', { url, error });
         }
     }
     
@@ -243,10 +296,30 @@
     }
     
     // ========================================
+    // PENDING REQUEST MANAGEMENT
+    // ========================================
+    
+    function cleanExpiredRequests(entry) {
+        let config = getConfig();
+        let now = Date.now();
+        let expired = [];
+        
+        for (let [requestId, request] of entry.pendingRequests) {
+            if (now - request.timestamp > config.requestTimeout) {
+                expired.push(requestId);
+            }
+        }
+        
+        expired.forEach(id => entry.pendingRequests.delete(id));
+    }
+    
+    // ========================================
     // MESSAGE RECEIVING & ROUTING
     // ========================================
     
-    function handleMessage(entry, event) {
+    async function handleMessage(entry, event) {
+        // Clean expired pending requests
+        cleanExpiredRequests(entry);
         let envelope;
         try {
             envelope = JSON.parse(event.data);
@@ -254,7 +327,7 @@
             // Not JSON, emit unknown message event
             let firstElement = entry.elements.values().next().value;
             if (firstElement) {
-                triggerEvent(firstElement, 'htmx:wsUnknownMessage', { data: event.data });
+                triggerEvent(firstElement, 'htmx:ws:unknownMessage', { data: event.data });
             }
             return;
         }
@@ -278,15 +351,12 @@
             return;
         }
         
-        // Route based on channel
+        // Route based on channel and format
         if (envelope.channel === 'ui' && envelope.format === 'html') {
-            handleHtmlMessage(targetElement, envelope);
-        } else if (envelope.channel && (envelope.channel === 'audio' || envelope.channel === 'json' || envelope.channel === 'binary')) {
-            // Known custom channel - emit event for extensions to handle
-            triggerEvent(targetElement, 'htmx:wsMessage', { ...envelope, element: targetElement });
+            await handleHtmlMessage(targetElement, envelope);
         } else {
-            // Unknown channel/format - emit unknown message event
-            triggerEvent(targetElement, 'htmx:wsUnknownMessage', { ...envelope, element: targetElement });
+            // Any other channel/format - emit event for extensions or application to handle
+            triggerEvent(targetElement, 'htmx:ws:message', { ...envelope, element: targetElement });
         }
         
         triggerEvent(targetElement, 'htmx:after:ws:message', { envelope, element: targetElement });
@@ -296,54 +366,58 @@
     // HTML PARTIAL HANDLING
     // ========================================
     
-    function handleHtmlMessage(element, envelope) {
+    async function handleHtmlMessage(element, envelope) {
+        // Parse the HTML to handle <hx-partial> elements
         let parser = new DOMParser();
         let doc = parser.parseFromString(envelope.payload, 'text/html');
-        
-        // Find all hx-partial elements
         let partials = doc.querySelectorAll('hx-partial');
         
-        if (partials.length === 0) {
-            // No partials, treat entire payload as content for element's target
-            let target = resolveTarget(element);
-            if (target) {
-                swapContent(target, envelope.payload, element);
+        if (partials.length > 0) {
+            // Handle partials - each hx-partial targets an element by ID
+            for (let partial of partials) {
+                let targetId = partial.getAttribute('id');
+                if (!targetId) continue;
+                
+                let target = document.getElementById(targetId);
+                if (!target) continue;
+                
+                // Get swap strategy
+                let swapStyle = envelope.swap || api.attributeValue(element, 'hx-swap') || htmx.config.defaultSwap || 'innerHTML';
+                swapStyle = swapStyle.split(' ')[0]; // Remove modifiers
+                
+                // Perform swap
+                doSwap(target, partial.innerHTML, swapStyle);
+                
+                // Process with htmx
+                htmx.process(target);
             }
-            return;
+        } else {
+            // No partials - swap entire payload into target
+            let targetSelector = envelope.target || api.attributeValue(element, 'hx-target');
+            let target;
+            
+            if (targetSelector) {
+                if (targetSelector === 'this') {
+                    target = element;
+                } else {
+                    target = document.getElementById(targetSelector.replace(/^#/, '')) || 
+                             document.querySelector(targetSelector);
+                }
+            }
+            
+            if (!target) {
+                target = element;
+            }
+            
+            let swapStyle = envelope.swap || api.attributeValue(element, 'hx-swap') || htmx.config.defaultSwap || 'innerHTML';
+            swapStyle = swapStyle.split(' ')[0]; // Remove modifiers
+            
+            doSwap(target, envelope.payload, swapStyle);
+            htmx.process(target);
         }
-        
-        partials.forEach(partial => {
-            let targetId = partial.getAttribute('id');
-            if (!targetId) return;
-            
-            let target = document.getElementById(targetId);
-            if (!target) return;
-            
-            swapContent(target, partial.innerHTML, element);
-        });
     }
     
-    function resolveTarget(element) {
-        let targetSelector = api.attributeValue(element, 'hx-target');
-        if (targetSelector) {
-            if (targetSelector === 'this') {
-                return element;
-            }
-            return document.querySelector(targetSelector);
-        }
-        return element;
-    }
-    
-    function swapContent(target, content, sourceElement) {
-        let swapStyle = api.attributeValue(sourceElement, 'hx-swap') || htmx.config.defaultSwap;
-        
-        // Parse swap style (just get the main style, ignore modifiers for now)
-        let style = swapStyle.split(' ')[0];
-        
-        // Normalize swap style
-        style = normalizeSwapStyle(style);
-        
-        // Perform swap
+    function doSwap(target, content, style) {
         switch (style) {
             case 'innerHTML':
                 target.innerHTML = content;
@@ -372,16 +446,6 @@
             default:
                 target.innerHTML = content;
         }
-        
-        // Process new content with HTMX
-        htmx.process(target);
-    }
-    
-    function normalizeSwapStyle(style) {
-        return style === 'before' ? 'beforebegin' :
-               style === 'after' ? 'afterend' :
-               style === 'prepend' ? 'afterbegin' :
-               style === 'append' ? 'beforeend' : style;
     }
     
     // ========================================
@@ -402,6 +466,9 @@
 
         let connectUrl = getWsAttribute(element, 'connect');
         if (!connectUrl) return;
+
+        // Normalize URL to ws:// or wss://
+        connectUrl = normalizeWebSocketUrl(connectUrl);
 
         element._htmx = element._htmx || {};
         element._htmx.wsInitialized = true;
@@ -441,6 +508,12 @@
         if (element._htmx?.wsSendInitialized) return;
 
         let sendUrl = getWsAttribute(element, 'send');
+        
+        // Normalize URL if provided
+        if (sendUrl) {
+            sendUrl = normalizeWebSocketUrl(sendUrl);
+        }
+        
         let triggerSpec = api.attributeValue(element, 'hx-trigger');
         
         if (!triggerSpec) {
@@ -519,6 +592,48 @@
     // EXTENSION REGISTRATION
     // ========================================
     
+    // Helper to process WebSocket elements globally
+    function processWebSocketElements(root) {
+        // Don't process if API not initialized yet
+        if (!api) return;
+        
+        const processNode = (node) => {
+            // Check for legacy attributes
+            checkLegacyAttributes(node);
+            
+            // Initialize WebSocket connection elements (check both variants)
+            if (hasWsAttribute(node, 'connect')) {
+                initializeElement(node);
+            }
+            
+            // Initialize send elements (check both variants)
+            if (hasWsAttribute(node, 'send')) {
+                initializeSendElement(node);
+            }
+        };
+
+        // Process the root itself
+        if (root.nodeType === Node.ELEMENT_NODE) {
+            processNode(root);
+        }
+        
+        // Build selector with prefix support
+        let prefix = htmx.config.prefix || 'hx-';
+        // Remove trailing hyphen if present since we'll add it
+        if (prefix.endsWith('-')) prefix = prefix.slice(0, -1);
+        
+        let selector = [
+            `[${prefix}-ws\\:connect]`, `[${prefix}-ws-connect]`, `[${prefix}-ws\\:send]`, 
+            `[${prefix}-ws-send]`, `[${prefix}-ws]`,
+            '[ws-connect]', '[ws-send]'  // Legacy
+        ].join(', ');
+        
+        // Process descendants
+        if (root.querySelectorAll) {
+            root.querySelectorAll(selector).forEach(processNode);
+        }
+    }
+    
     htmx.registerExtension('ws', {
         init: (internalAPI) => {
             api = internalAPI;
@@ -527,40 +642,105 @@
             if (!htmx.config.websockets) {
                 htmx.config.websockets = {};
             }
+            
+            // Process any existing elements on init
+            if (document.body) {
+                processWebSocketElements(document.body);
+            }
+            
+            // Implement pauseInBackground
+            let config = getConfig();
+            if (config.pauseInBackground) {
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden) {
+                        // Page hidden - pause all reconnect timers
+                        for (let entry of connectionRegistry.values()) {
+                            if (entry.reconnectTimer) {
+                                clearTimeout(entry.reconnectTimer);
+                                entry.reconnectTimer = null;
+                                entry._pausedForBackground = true;
+                            }
+                        }
+                    } else {
+                        // Page visible - resume reconnects for paused connections
+                        for (let [url, entry] of connectionRegistry.entries()) {
+                            if (entry._pausedForBackground && (!entry.socket || entry.socket.readyState !== WebSocket.OPEN)) {
+                                delete entry._pausedForBackground;
+                                scheduleReconnect(url, entry);
+                            }
+                        }
+                    }
+                });
+            }
         },
         
         htmx_after_process: (element) => {
-            const processNode = (node) => {
-                // Check for legacy attributes
-                checkLegacyAttributes(node);
-                
-                // Initialize WebSocket connection elements (check both variants)
-                if (hasWsAttribute(node, 'connect')) {
-                    initializeElement(node);
-                }
-                
-                // Initialize send elements (check both variants)
-                if (hasWsAttribute(node, 'send')) {
-                    initializeSendElement(node);
-                }
-            };
-
-            // Process the element itself
-            processNode(element);
-            
-            // Process descendants
-            element.querySelectorAll('[hx-ws\\:connect], [hx-ws-connect], [hx-ws\\:send], [hx-ws-send], [hx-ws], [ws-connect], [ws-send]').forEach(processNode);
+            // Process WebSocket elements even without hx-ext="ws"
+            processWebSocketElements(element);
         },
         
         htmx_before_cleanup: (element) => {
             cleanupElement(element);
+        },
+        
+        // Global event handler - processes all htmx events
+        onEvent: (name, evt) => {
+            // Process nodes as they're added to the DOM by htmx
+            if (name === 'htmx:load' && evt.detail && evt.detail.elt) {
+                processWebSocketElements(evt.detail.elt);
+            } else if (name === 'htmx:afterProcessNode' && evt.detail && evt.detail.elt) {
+                processWebSocketElements(evt.detail.elt);
+            } else if (name === 'htmx:afterSwap' && evt.target) {
+                processWebSocketElements(evt.target);
+            }
+            return true; // Allow event to continue
         }
     });
     
-    // Expose registry for testing
+    
+    // ========================================
+    // PUBLIC API FOR COMPANION EXTENSIONS
+    // ========================================
+    
+    /**
+     * Send data over a WebSocket connection associated with an element.
+     * 
+     * @param {HTMLElement} element - Element with a WebSocket connection
+     * @param {*} data - Data to send (will be JSON.stringify'd)
+     * @returns {boolean} - True if sent successfully, false otherwise
+     */
+    function sendRaw(element, data) {
+        let url = element._htmx?.wsUrl;
+        if (!url) {
+            // Try to find parent with connection
+            let prefix = htmx.config.prefix || '';
+            let ancestor = element.closest('[' + prefix + 'hx-ws\\:connect],[' + prefix + 'hx-ws-connect]');
+            if (ancestor) {
+                url = normalizeWebSocketUrl(getWsAttribute(ancestor, 'connect'));
+            }
+        }
+        
+        if (!url) {
+            return false;
+        }
+        
+        let entry = connectionRegistry.get(url);
+        if (entry?.socket?.readyState === WebSocket.OPEN) {
+            entry.socket.send(JSON.stringify(data));
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Expose API for testing and companion extensions
     if (typeof window !== 'undefined' && window.htmx) {
         window.htmx.ext = window.htmx.ext || {};
         window.htmx.ext.ws = {
+            // Public API for companion extensions
+            send: sendRaw,
+            
+            // Testing API
             getRegistry: () => ({
                 clear: () => {
                     let entries = Array.from(connectionRegistry.values());
