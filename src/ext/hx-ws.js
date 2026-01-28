@@ -419,15 +419,16 @@
     // MESSAGE RECEIVING & ROUTING
     // ========================================
     
-    function handleMessage(entry, event) {
+    async function handleMessage(entry, event) {
         let envelope;
         try {
             envelope = JSON.parse(event.data);
         } catch (e) {
-            // Not JSON, emit unknown message event for parse failures
+            // Not JSON - treat as raw HTML and swap directly
+            // This allows streaming hx-partials without JSON wrapping
             let firstElement = entry.elements.values().next().value;
             if (firstElement) {
-                triggerEvent(firstElement, 'htmx:wsUnknownMessage', { data: event.data, parseError: e });
+                await handleHtmlMessage(firstElement, { payload: event.data });
             }
             return;
         }
@@ -453,7 +454,7 @@
         
         // Route based on channel
         if (envelope.channel === 'ui' && envelope.format === 'html') {
-            handleHtmlMessage(targetElement, envelope);
+            await handleHtmlMessage(targetElement, envelope);
         } else {
             // Any non-ui/html message emits htmx:wsMessage for application handling
             // This is extensible - apps can handle json, audio, binary, custom channels, etc.
@@ -464,35 +465,46 @@
     }
     
     // ========================================
-    // HTML PARTIAL HANDLING - Using htmx.swap(ctx)
+    // HTML MESSAGE HANDLING - Using htmx.swap(ctx)
     // ========================================
     
-    function handleHtmlMessage(element, envelope) {
-        let parser = new DOMParser();
-        let doc = parser.parseFromString(envelope.payload || '', 'text/html');
+    /**
+     * Handle HTML messages by delegating to htmx.swap().
+     * 
+     * This lets core htmx handle:
+     * - Script tag execution
+     * - Partials (<template hx type="partial">)
+     * - Out-of-band swaps (hx-swap-oob)
+     * - All swap styles
+     * - CSS transitions
+     * - Focus handling
+     * - Scroll handling
+     */
+    async function handleHtmlMessage(element, envelope) {
+        // Resolve target from envelope or element attributes
+        let target = resolveTarget(element, envelope.target);
         
-        // Find all hx-partial elements (legacy format)
-        let partials = doc.querySelectorAll('hx-partial');
+        // Build swap context matching what htmx.swap() expects
+        let ctx = {
+            text: envelope.payload || '',
+            target: target,
+            swap: envelope.swap || api.attributeValue(element, 'hx-swap') || htmx.config.defaultSwap,
+            sourceElement: element,
+            select: envelope.select || null,
+            selectOOB: envelope.selectOOB || null,
+            // Disable CSS transitions by default for WS swaps
+            // (htmx.swap defaults to true if undefined due to !== false check)
+            transition: false
+        };
         
-        if (partials.length === 0) {
-            // No partials, treat entire payload as content for element's target
-            let target = resolveTarget(element, envelope.target);
-            if (target) {
-                swapWithHtmx(target, envelope.payload, element, envelope.swap);
-            }
-            return;
-        }
-        
-        // Process each partial
-        for (let partial of partials) {
-            let targetId = partial.getAttribute('id');
-            if (!targetId) continue;
-            
-            let target = document.getElementById(targetId);
-            if (!target) continue;
-            
-            swapWithHtmx(target, partial.innerHTML, element);
-        }
+        // Delegate to htmx.swap() which handles everything:
+        // - Making fragment from text
+        // - Processing OOB swaps
+        // - Processing partials (<template hx type="partial">)
+        // - Script execution
+        // - CSS transitions
+        // - Focus and scroll handling
+        await htmx.swap(ctx);
     }
     
     function resolveTarget(element, envelopeTarget) {
@@ -510,45 +522,6 @@
             return document.querySelector(targetSelector);
         }
         return element;
-    }
-
-    function processScriptTags(container) {
-        let scripts = container.querySelectorAll('script');
-        for (let oldScript of scripts) {
-            let newScript = document.createElement('script');
-            for (let attr of oldScript.attributes) {
-                newScript.setAttribute(attr.name, attr.value);
-            }
-            newScript.textContent = oldScript.textContent;
-            oldScript.parentNode.replaceChild(newScript, oldScript);
-        }
-    }
-
-    function swapWithHtmx(target, content, sourceElement, envelopeSwap) {
-        // Determine swap style from envelope, element attribute, or default
-        let swapStyle = envelopeSwap || api.attributeValue(sourceElement, 'hx-swap') || htmx.config.defaultSwap;
-
-        // Create a document fragment from the HTML content
-        let template = document.createElement('template');
-        template.innerHTML = content || '';
-        let fragment = template.content;
-
-        // Process script tags to ensure they execute
-        processScriptTags(fragment);
-
-        // Use htmx's internal insertContent which handles:
-        // - All swap styles correctly
-        // - Processing new content with htmx.process()
-        // - Preserved elements
-        // - Auto-focus
-        // - Scroll handling
-        let task = {
-            target: target,
-            swapSpec: swapStyle,  // Can be a string - insertContent will parse it
-            fragment: fragment
-        };
-
-        api.insertContent(task);
     }
     
     // ========================================
