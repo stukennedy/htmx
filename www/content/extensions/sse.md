@@ -161,8 +161,6 @@ The extension uses exponential backoff with jitter:
 
 Fired before a connection attempt (initial or reconnection). Set `detail.connection.cancelled = true` to prevent the connection.
 
-For reconnections (`detail.connection.attempt > 0`), you can also modify `detail.connection.delay` to change the backoff delay.
-
 ```javascript
 document.body.addEventListener('htmx:before:sse:connection', function(evt) {
     if (evt.detail.connection.attempt > 10) {
@@ -171,8 +169,9 @@ document.body.addEventListener('htmx:before:sse:connection', function(evt) {
 });
 ```
 
+The `detail.connection` is the actual internal state object, which includes:
+
 * `detail.connection.attempt` - attempt number (`0` = initial, `> 0` = reconnection)
-* `detail.connection.delay` - the delay before connection (ms), modifiable
 * `detail.connection.url` - the SSE endpoint URL
 * `detail.connection.lastEventId` - the last event ID received
 * `detail.connection.cancelled` - set to `true` to cancel
@@ -181,10 +180,9 @@ document.body.addEventListener('htmx:before:sse:connection', function(evt) {
 
 Fired after a successful connection (or reconnection) to the SSE stream.
 
-* `detail.connection.attempt` - attempt number (`0` = initial, `> 0` = reconnection)
-* `detail.connection.url` - the SSE endpoint URL
-* `detail.connection.status` - the HTTP status code
-* `detail.connection.lastEventId` - the last event ID received
+The `detail.connection` is the same state object as in `before`, plus:
+
+* `detail.connection.status` - the HTTP status code of the response
 
 ### `htmx:before:sse:message`
 
@@ -218,11 +216,14 @@ Fired after an SSE message has been processed.
 Fired when a stream error occurs.
 
 * `detail.error` - the error object
+* `detail.url` - the SSE endpoint URL
+* `detail.status` - the HTTP status code (only present for non-2xx reconnect responses)
 
 ### `htmx:sse:close`
 
 Fired when an SSE connection is closed.
 
+* `detail.connection` - the actual connection object (same object as in `before`/`after` events)
 * `detail.reason` - why the connection was closed:
   * `"message"` - closed by `hx-sse:close` matching a named event
   * `"removed"` - the element was removed from the DOM

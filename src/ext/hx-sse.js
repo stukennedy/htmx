@@ -101,27 +101,27 @@
     async function handleSSEResponse(ctx) {
         let element = ctx.sourceElement;
         let config = getConfig(ctx);
-        let lastEventId = null;
-        let attempt = 0;
-        let reader = null;
         let reconnectRequested = false;
-        let delayCanceller = null;
 
-        let state = {
+        let connection = {
+            url: ctx.request.action,
             abortController: null,
             reader: null,
             lastEventId: null,
             delayCanceller: null,
-            visibilityHandler: null
+            visibilityHandler: null,
+            attempt: 0,
+            cancelled: false,
+            status: null
         };
         element._htmx = element._htmx || {};
-        element._htmx.sse = state;
+        element._htmx.sse = connection;
 
         let reconnect = () => {
             if (!element.isConnected || reconnectRequested) return;
             reconnectRequested = true;
-            if (delayCanceller) delayCanceller();
-            reader?.cancel();
+            if (connection.delayCanceller) connection.delayCanceller();
+            connection.reader?.cancel();
         };
 
         let paused = false;
@@ -131,49 +131,48 @@
             let visibilityHandler = () => {
                 if (document.hidden) {
                     paused = true;
-                    reader?.cancel();
+                    connection.reader?.cancel();
                 } else if (paused) {
                     paused = false;
                     if (unpauseResolver) unpauseResolver();
                 }
             };
             document.addEventListener('visibilitychange', visibilityHandler);
-            state.visibilityHandler = visibilityHandler;
+            connection.visibilityHandler = visibilityHandler;
         }
 
-        let connectDetail = {attempt: 0, delay: 0, url: ctx.request.action, lastEventId: null, cancelled: false};
-        if (!htmx.trigger(element, 'htmx:before:sse:connection', {connection: connectDetail}) || connectDetail.cancelled) {
+        connection.cancelled = false;
+        if (!htmx.trigger(element, 'htmx:before:sse:connection', {connection}) || connection.cancelled) {
             cleanup(element, 'cancelled');
             return;
         }
 
-        htmx.trigger(element, 'htmx:after:sse:connection', {
-            connection: {attempt: 0, url: ctx.request.action, status: ctx.response.status, lastEventId: null}
-        });
+        connection.status = ctx.response.status;
+        htmx.trigger(element, 'htmx:after:sse:connection', {connection});
 
         let currentResponse = ctx.response.raw;
 
         try {
             while (element.isConnected) {
                 // Reconnection (not on first iteration — we already have the response)
-                if (attempt > 0) {
+                if (connection.attempt > 0) {
                     // Wait while paused (tab backgrounded with pauseOnBackground)
                     if (paused) {
                         await new Promise(r => { unpauseResolver = r; });
                         unpauseResolver = null;
                         if (!element.isConnected) break;
-                        attempt = 1; // reset so delay doesn't escalate from pauses
+                        connection.attempt = 1; // reset so delay doesn't escalate from pauses
                         reconnectRequested = true; // bypass maxAttempts check
                     }
 
                     if (!reconnectRequested) {
-                        if (!config.reconnect || attempt > config.reconnectMaxAttempts) break;
+                        if (!config.reconnect || connection.attempt > config.reconnectMaxAttempts) break;
                     }
 
                     let baseDelay = htmx.parseInterval(config.reconnectDelay) ?? config.reconnectDelay;
                     let maxDelay = htmx.parseInterval(config.reconnectMaxDelay) ?? config.reconnectMaxDelay;
                     let delay = Math.min(
-                        baseDelay * Math.pow(2, attempt - 1),
+                        baseDelay * Math.pow(2, connection.attempt - 1),
                         maxDelay
                     );
                     if (config.reconnectJitter > 0) {
@@ -181,67 +180,63 @@
                         delay = Math.max(0, delay + (Math.random() * 2 - 1) * jitterRange);
                     }
 
-                    let detail = {attempt, delay, url: ctx.request.action, lastEventId, cancelled: false};
-                    if (!htmx.trigger(element, 'htmx:before:sse:connection', {connection: detail}) || detail.cancelled) break;
+                    connection.cancelled = false;
+                    if (!htmx.trigger(element, 'htmx:before:sse:connection', {connection}) || connection.cancelled) break;
 
                     await new Promise(r => {
-                        delayCanceller = r;
-                        state.delayCanceller = r;
-                        setTimeout(r, detail.delay);
+                        connection.delayCanceller = r;
+                        setTimeout(r, delay);
                     });
-                    delayCanceller = null;
-                    state.delayCanceller = null;
+                    connection.delayCanceller = null;
                     if (!element.isConnected) break;
 
                     // Re-fetch using saved request context (no full pipeline re-run)
                     let ac = new AbortController();
-                    state.abortController = ac;
+                    connection.abortController = ac;
                     try {
-                        if (lastEventId) ctx.request.headers['Last-Event-ID'] = lastEventId;
+                        if (connection.lastEventId) ctx.request.headers['Last-Event-ID'] = connection.lastEventId;
                         currentResponse = await fetch(ctx.request.action, {
                             ...ctx.request,
                             signal: ac.signal
                         });
                     } catch (e) {
                         if (ac.signal.aborted) break;
-                        htmx.trigger(element, 'htmx:sse:error', {error: e});
+                        htmx.trigger(element, 'htmx:sse:error', {error: e, url: ctx.request.action});
                         reconnectRequested = false;
-                        attempt++;
+                        connection.attempt++;
                         continue;
                     }
 
                     if (!currentResponse.ok) {
                         htmx.trigger(element, 'htmx:sse:error', {
                             error: new Error(`SSE reconnect failed with status ${currentResponse.status}`),
-                            status: currentResponse.status
+                            status: currentResponse.status,
+                            url: ctx.request.action
                         });
                         reconnectRequested = false;
-                        attempt++;
+                        connection.attempt++;
                         continue;
                     }
 
-                    htmx.trigger(element, 'htmx:after:sse:connection', {
-                        connection: {attempt, url: ctx.request.action, status: currentResponse.status, lastEventId}
-                    });
-                    attempt = 0;
+                    connection.status = currentResponse.status;
+                    htmx.trigger(element, 'htmx:after:sse:connection', {connection});
+                    connection.attempt = 0;
                 }
 
                 // Stream messages
                 reconnectRequested = false;
 
                 try {
-                    reader = currentResponse.body.getReader();
-                    state.reader = reader;
+                    connection.reader = currentResponse.body.getReader();
 
-                    for await (let msg of parseSSE(reader)) {
+                    for await (let msg of parseSSE(connection.reader)) {
                         if (!element.isConnected || reconnectRequested) break;
 
                         let detail = {data: msg.data, event: msg.event, id: msg.id, cancelled: false};
                         if (!htmx.trigger(element, 'htmx:before:sse:message', {message: detail}) || detail.cancelled) continue;
 
                         if (msg.id) {
-                            lastEventId = msg.id;
-                            state.lastEventId = msg.id;
+                            connection.lastEventId = msg.id;
                         }
                         if (msg.retry != null) config.reconnectDelay = msg.retry;
 
@@ -264,16 +259,15 @@
                         htmx.trigger(element, 'htmx:after:sse:message', {message: detail});
                     }
                 } catch (e) {
-                    if (!state.abortController?.signal?.aborted) {
-                        htmx.trigger(element, 'htmx:sse:error', {error: e});
+                    if (!connection.abortController?.signal?.aborted) {
+                        htmx.trigger(element, 'htmx:sse:error', {error: e, url: ctx.request.action});
                     }
                 }
 
-                reader = null;
-                state.reader = null;
+                connection.reader = null;
                 if (!element.isConnected) break;
 
-                attempt++;
+                connection.attempt++;
             }
         } finally {
             cleanup(element, element.isConnected ? 'ended' : 'removed');
@@ -301,17 +295,17 @@
     // ========================================
 
     function cleanup(element, reason) {
-        let state = element?._htmx?.sse;
-        if (!state) return;
+        let connection = element?._htmx?.sse;
+        if (!connection) return;
 
-        state.abortController?.abort();
-        state.reader?.cancel?.();
-        if (state.delayCanceller) state.delayCanceller();
-        if (state.visibilityHandler) {
-            document.removeEventListener('visibilitychange', state.visibilityHandler);
+        connection.abortController?.abort();
+        connection.reader?.cancel?.();
+        if (connection.delayCanceller) connection.delayCanceller();
+        if (connection.visibilityHandler) {
+            document.removeEventListener('visibilitychange', connection.visibilityHandler);
         }
+        htmx.trigger(element, 'htmx:sse:close', {connection, reason: reason || 'cleanup'});
         delete element._htmx.sse;
-        htmx.trigger(element, 'htmx:sse:close', {reason: reason || 'cleanup'});
     }
 
     // ========================================
@@ -331,7 +325,7 @@
 
             // Take over — core will return without calling response.text()
             handleSSEResponse(ctx).catch(e => {
-                htmx.trigger(element, 'htmx:sse:error', {error: e});
+                htmx.trigger(element, 'htmx:sse:error', {error: e, url: ctx.request.action});
                 cleanup(element);
             });
             return false;
