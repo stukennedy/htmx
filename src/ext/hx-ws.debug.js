@@ -195,7 +195,9 @@
             }, opts);
 
             connection.socket.addEventListener('close', (event) => {
-                if (event.target !== connection.socket) return;
+                console.log('[DEBUG-CLOSE] event.target === connection.socket:', event.target === connection.socket);
+                console.log('[DEBUG-CLOSE] connections.has(url):', connections ? true : false, url);
+                if (event.target !== connection.socket) { console.log('[DEBUG-CLOSE] EARLY RETURN: target mismatch'); return; }
 
                 let elt = findConnectedElement(url);
                 if (elt) htmx.trigger(elt, 'htmx:ws:close', {
@@ -207,7 +209,9 @@
                 let config = connection.config;
                 if (config.pauseOnBackground && document.hidden) return;
 
+                console.log('[DEBUG-CLOSE] config.reconnect:', config.reconnect, 'findConnectedElement:', !!findConnectedElement(url));
                 if (config.reconnect && findConnectedElement(url)) {
+                    console.log('[DEBUG-CLOSE] calling scheduleReconnect');
                     scheduleReconnect(url, connection);
                 } else {
                     // No element or reconnect disabled — full cleanup
@@ -439,11 +443,7 @@
                 html = detail.message.json.content;
             } else if (detail.message.json.payload !== undefined) {
                 html = detail.message.json.payload; // backwards compat
-                // Warn once per connection (not on every message)
-                if (!connection._payloadWarnFired) {
-                    console.warn('[htmx-ws] json.payload is deprecated, use json.content instead');
-                    connection._payloadWarnFired = true;
-                }
+                console.warn('[htmx-ws] json.payload is deprecated, use json.content instead');
             }
         } else {
             html = detail.message.text;
@@ -588,15 +588,6 @@
     
     // Expose connections for testing
     if (typeof window !== 'undefined' && window.htmx) {
-        // Clean up all WS connections on page navigation to prevent browser errors
-        window.addEventListener('pagehide', () => {
-            connections.forEach((connection) => {
-                if (connection.socket) {
-                    connection.socket.close(1001, 'page navigating away');
-                }
-            });
-        });
-
         window.htmx.ext = window.htmx.ext || {};
         window.htmx.ext.ws = {
             getRegistry: () => ({
