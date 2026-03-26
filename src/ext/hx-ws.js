@@ -27,7 +27,14 @@
             let ctx = api.createRequestContext(element, new CustomEvent('_'));
             perElement = ctx.request.ws || {};
         }
-        return { ...defaults, ...global, ...perElement };
+        let merged = { ...defaults, ...global, ...perElement };
+
+        // Backwards compat: boolean reconnectJitter (old API used true/false)
+        if (typeof merged.reconnectJitter === 'boolean') {
+            merged.reconnectJitter = merged.reconnectJitter ? 0.3 : 0;
+        }
+
+        return merged;
     }
     
     // ========================================
@@ -126,6 +133,28 @@
         return null;
     }
 
+    // Close and fully clean up an orphaned connection (no owning element in DOM)
+    function cleanupOrphanedConnection(url, connection) {
+        if (connection.timer) clearTimeout(connection.timer);
+        if (connection.visibilityHandler) {
+            document.removeEventListener('visibilitychange', connection.visibilityHandler);
+        }
+        if (connection.abortController) {
+            connection.abortController.abort();
+        }
+        cleanupPendingRequests(connection);
+        if (connection.socket) {
+            try {
+                if (connection.socket.readyState === WebSocket.OPEN || connection.socket.readyState === WebSocket.CONNECTING) {
+                    connection.socket.close();
+                }
+            } catch (e) {
+                // Socket may already be in an invalid state
+            }
+        }
+        connections.delete(url);
+    }
+
     function createWebSocket(url, connection) {
         // Abort old socket's listeners and close it
         if (connection.abortController) {
@@ -151,7 +180,13 @@
 
             connection.socket.addEventListener('open', () => {
                 let elt = findConnectedElement(url);
-                if (elt) htmx.trigger(elt, 'htmx:after:ws:connection', {connection});
+                if (elt) {
+                    htmx.trigger(elt, 'htmx:after:ws:connection', {connection});
+                } else {
+                    // Element was removed while connecting — orphaned socket
+                    cleanupOrphanedConnection(url, connection);
+                    return;
+                }
                 connection.attempt = 0;
             }, opts);
 
@@ -175,8 +210,8 @@
                 if (config.reconnect && findConnectedElement(url)) {
                     scheduleReconnect(url, connection);
                 } else {
-                    cleanupPendingRequests(connection);
-                    connections.delete(url);
+                    // No element or reconnect disabled — full cleanup
+                    cleanupOrphanedConnection(url, connection);
                 }
             }, opts);
 
@@ -198,8 +233,7 @@
         let attempt = connection.attempt;
 
         if (!config.reconnect || attempt > config.reconnectMaxAttempts) {
-            cleanupPendingRequests(connection);
-            connections.delete(url);
+            cleanupOrphanedConnection(url, connection);
             return;
         }
 
@@ -217,15 +251,20 @@
         if (elt) {
             connection.cancelled = false;
             if (!htmx.trigger(elt, 'htmx:before:ws:connection', {connection}) || connection.cancelled) {
-                cleanupPendingRequests(connection);
-                connections.delete(url);
+                cleanupOrphanedConnection(url, connection);
                 return;
             }
+        } else {
+            // Element gone — no point scheduling reconnect
+            cleanupOrphanedConnection(url, connection);
+            return;
         }
 
         connection.timer = setTimeout(() => {
             if (findConnectedElement(url)) {
                 createWebSocket(url, connection);
+            } else {
+                cleanupOrphanedConnection(url, connection);
             }
         }, delay);
     }
@@ -237,6 +276,9 @@
         if (connection.timer) clearTimeout(connection.timer);
         if (connection.visibilityHandler) {
             document.removeEventListener('visibilitychange', connection.visibilityHandler);
+        }
+        if (connection.abortController) {
+            connection.abortController.abort();
         }
         cleanupPendingRequests(connection);
         htmx.trigger(element, 'htmx:ws:close', {
@@ -357,17 +399,28 @@
             // Not JSON - will be treated as raw HTML below
         }
 
+        // [Correlation] Cleanup expired pending requests on every message
+        cleanupExpiredRequests(connection);
+
         // [Correlation] Match response to originating element, or fall back to first subscriber
         let connectionElement = null;
         let requestId = json?.['HX-Request-ID'] || json?.request_id;
         if (requestId && connection.pendingRequests.has(requestId)) {
             connectionElement = connection.pendingRequests.get(requestId).element;
             connection.pendingRequests.delete(requestId);
+            // If the correlated element has been removed from the DOM, fall back
+            if (!connectionElement.isConnected) {
+                connectionElement = findConnectedElement(connection.url);
+            }
         } else {
             connectionElement = findConnectedElement(connection.url);
         }
 
-        if (!connectionElement) return;
+        if (!connectionElement) {
+            // No element in DOM for this connection — orphan cleanup
+            cleanupOrphanedConnection(connection.url, connection);
+            return;
+        }
 
         let detail = {
             message: { text: event.data, json, cancelled: false }
@@ -377,10 +430,20 @@
             return;
         }
 
-        // JSON with 'content' field: swap the HTML
+        // JSON with 'content' or 'payload' field: swap the HTML
         // Raw (non-JSON) string: swap the entire string as HTML
-        // JSON without 'content': data-only message, no swap (handle via events)
-        let html = detail.message.json ? detail.message.json.content : detail.message.text;
+        // JSON without 'content'/'payload': data-only message, no swap (handle via events)
+        let html;
+        if (detail.message.json) {
+            if (detail.message.json.content !== undefined) {
+                html = detail.message.json.content;
+            } else if (detail.message.json.payload !== undefined) {
+                html = detail.message.json.payload; // backwards compat
+                console.warn('[htmx-ws] json.payload is deprecated, use json.content instead');
+            }
+        } else {
+            html = detail.message.text;
+        }
         if (html != null) {
             let target = detail.message.json?.target || api.attributeValue(connectionElement, 'hx-target');
             let swap = detail.message.json?.swap || api.attributeValue(connectionElement, 'hx-swap');

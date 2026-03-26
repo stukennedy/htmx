@@ -1718,4 +1718,361 @@ describe('hx-ws WebSocket extension', function() {
             assert.equal(receivedMessage.content, '<p>Hello</p>');
         });
     });
+
+    // ========================================
+    // 12. ORPHANED CONNECTION CLEANUP TESTS (BLOCKER 1)
+    // ========================================
+
+    describe('Orphaned Connection Cleanup', function() {
+
+        it('closes WebSocket when connect element is swapped out mid-connection', async function() {
+            let container = createProcessedHTML(`
+                <div id="outer">
+                    <div id="ws-host" hx-ws:connect="/ws/test">
+                        <div id="content">Hello</div>
+                    </div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            assert.equal(ws.readyState, mockWebSocket.OPEN, 'WebSocket should be open');
+            let registry = htmx.ext.ws.getRegistry();
+            assert.isTrue(registry.has('/ws/test'), 'Connection should be in registry');
+
+            // Swap out the ws-host element entirely (simulates hx-swap replacing it)
+            await htmx.swap({
+                text: '<div id="ws-host">Replaced — no hx-ws:connect</div>',
+                target: document.getElementById('outer'),
+                swap: 'innerHTML'
+            });
+            await htmx.timeout(50);
+
+            assert.equal(ws.readyState, mockWebSocket.CLOSED, 'WebSocket should be closed after element removal');
+            assert.isFalse(registry.has('/ws/test'), 'Connection should be removed from registry');
+        });
+
+        it('cleans up connection when element is removed and message arrives', async function() {
+            let container = createProcessedHTML(`
+                <div id="outer">
+                    <div id="ws-host" hx-ws:connect="/ws/test" hx-target="#content">
+                        <div id="content"></div>
+                    </div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            let registry = htmx.ext.ws.getRegistry();
+
+            // Remove the element without triggering htmx cleanup (simulates raw DOM removal)
+            document.getElementById('ws-host').remove();
+            await htmx.timeout(20);
+
+            // Now a message arrives on the orphaned socket
+            ws.simulateMessage({ content: '<p>Ghost message</p>' });
+            await htmx.timeout(20);
+
+            assert.equal(ws.readyState, mockWebSocket.CLOSED, 'WebSocket should be closed');
+            assert.isFalse(registry.has('/ws/test'), 'Connection should be cleaned up');
+        });
+
+        it('cleans up connection on close when element is gone (no reconnect)', async function() {
+            htmx.config.websockets = { reconnect: true, reconnectDelay: 20 };
+
+            let container = createProcessedHTML(`
+                <div id="outer">
+                    <div id="ws-host" hx-ws:connect="/ws/test">
+                        <div id="content">Hello</div>
+                    </div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            let registry = htmx.ext.ws.getRegistry();
+
+            // Remove element from DOM without htmx cleanup
+            document.getElementById('ws-host').remove();
+            await htmx.timeout(20);
+
+            // Server-side close
+            ws.close();
+            await htmx.timeout(100);
+
+            // Should NOT attempt reconnection, should clean up
+            assert.equal(mockWebSocketInstances.length, 1, 'Should not create new WebSocket');
+            assert.isFalse(registry.has('/ws/test'), 'Connection should be removed from registry');
+        });
+
+        it('cleans up when element removed during reconnect delay', async function() {
+            htmx.config.websockets = { reconnect: true, reconnectDelay: 200, reconnectJitter: 0 };
+
+            let container = createProcessedHTML(`
+                <div id="outer">
+                    <div id="ws-host" hx-ws:connect="/ws/test">Content</div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            let registry = htmx.ext.ws.getRegistry();
+
+            // Close to trigger reconnect scheduling
+            ws.close();
+            await htmx.timeout(20);
+
+            // Remove element during the reconnect delay
+            await htmx.swap({
+                text: '<div>No more WS</div>',
+                target: document.getElementById('outer'),
+                swap: 'innerHTML'
+            });
+            await htmx.timeout(250);
+
+            // Reconnect timer should have fired but found no element, so no new socket
+            assert.equal(mockWebSocketInstances.length, 1, 'Should not reconnect after element removal');
+            assert.isFalse(registry.has('/ws/test'), 'Connection should be cleaned up');
+        });
+    });
+
+    // ========================================
+    // 13. BACKWARDS COMPAT — json.payload (BLOCKER 2)
+    // ========================================
+
+    describe('Backwards Compatibility - json.payload', function() {
+
+        it('swaps HTML from json.payload with deprecation warning', async function() {
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test" hx-target="#content">
+                    <div id="content">Original</div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let warnMessage = null;
+            let originalWarn = console.warn;
+            console.warn = (msg) => { warnMessage = msg; };
+
+            let ws = mockWebSocketInstances[0];
+            ws.simulateMessage({
+                payload: '<hx-partial id="content"><p>Via payload</p></hx-partial>'
+            });
+            await htmx.timeout(20);
+
+            console.warn = originalWarn;
+
+            assert.include(document.getElementById('content').innerHTML, 'Via payload');
+            assert.isNotNull(warnMessage, 'Should emit deprecation warning');
+            assert.include(warnMessage, 'payload');
+            assert.include(warnMessage, 'deprecated');
+        });
+
+        it('prefers json.content over json.payload when both present', async function() {
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test" hx-target="#content">
+                    <div id="content">Original</div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let warnCalled = false;
+            let originalWarn = console.warn;
+            console.warn = () => { warnCalled = true; };
+
+            let ws = mockWebSocketInstances[0];
+            ws.simulateMessage({
+                content: '<p>From content</p>',
+                payload: '<p>From payload</p>'
+            });
+            await htmx.timeout(20);
+
+            console.warn = originalWarn;
+
+            assert.include(document.getElementById('content').innerHTML, 'From content');
+            assert.notInclude(document.getElementById('content').innerHTML, 'From payload');
+            assert.isFalse(warnCalled, 'Should not warn when content is present');
+        });
+
+        it('does not swap when neither content nor payload is present', async function() {
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test" hx-target="#content">
+                    <div id="content">Original</div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            ws.simulateMessage({ type: 'ping', data: 'hello' });
+            await htmx.timeout(20);
+
+            assert.equal(document.getElementById('content').textContent, 'Original');
+        });
+
+        it('handles json.payload with target and swap overrides', async function() {
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test">
+                    <div id="list"><p>Item 1</p></div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let originalWarn = console.warn;
+            console.warn = () => {}; // suppress
+
+            let ws = mockWebSocketInstances[0];
+            ws.simulateMessage({
+                payload: '<p>Item 2</p>',
+                target: '#list',
+                swap: 'beforeend'
+            });
+            await htmx.timeout(20);
+
+            console.warn = originalWarn;
+
+            let list = document.getElementById('list');
+            assert.include(list.innerHTML, 'Item 1');
+            assert.include(list.innerHTML, 'Item 2');
+        });
+    });
+
+    // ========================================
+    // 14. RECONNECT JITTER BOOLEAN COMPAT (POLISH)
+    // ========================================
+
+    describe('reconnectJitter Boolean Compatibility', function() {
+
+        it('treats reconnectJitter: true as 0.3 (default jitter)', async function() {
+            htmx.config.websockets = {
+                reconnect: true,
+                reconnectDelay: 50,
+                reconnectJitter: true
+            };
+
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test"></div>
+            `);
+            await htmx.timeout(50);
+
+            // Should reconnect without breaking (true * delay would give NaN-like behavior)
+            let ws = mockWebSocketInstances[0];
+            ws.close();
+            await htmx.timeout(150);
+
+            assert.isTrue(mockWebSocketInstances.length > 1, 'Should reconnect with boolean jitter=true');
+        });
+
+        it('treats reconnectJitter: false as 0 (no jitter)', async function() {
+            htmx.config.websockets = {
+                reconnect: true,
+                reconnectDelay: 50,
+                reconnectJitter: false
+            };
+
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test"></div>
+            `);
+            await htmx.timeout(50);
+
+            let ws = mockWebSocketInstances[0];
+            ws.close();
+            await htmx.timeout(100);
+
+            assert.isTrue(mockWebSocketInstances.length > 1, 'Should reconnect with boolean jitter=false');
+        });
+    });
+
+    // ========================================
+    // 15. ADDITIONAL FINDINGS — DEEP REVIEW
+    // ========================================
+
+    describe('Deep Review Fixes', function() {
+
+        it('falls back to live element when correlated element is removed from DOM', async function() {
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test">
+                    <form id="form1" hx-ws:send hx-trigger="submit" hx-target="#result">
+                        <input name="msg" value="hello">
+                    </form>
+                    <div id="result"></div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let form = document.getElementById('form1');
+            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            await htmx.timeout(20);
+
+            let ws = mockWebSocketInstances[0];
+            let sent = JSON.parse(ws.lastSent);
+            let requestId = sent.headers['HX-Request-ID'];
+
+            // Remove the form that sent the request (simulates swap replacing the form)
+            form.remove();
+            await htmx.timeout(20);
+
+            // Server responds with the request ID — should fall back to live connect element
+            ws.simulateMessage({
+                content: '<hx-partial id="result">Response</hx-partial>',
+                'HX-Request-ID': requestId
+            });
+            await htmx.timeout(20);
+
+            assert.include(document.getElementById('result').innerHTML, 'Response');
+        });
+
+        it('cleans up expired pending requests on message receive', async function() {
+            htmx.config.websockets = { pendingRequestTTL: 50 };
+
+            let container = createProcessedHTML(`
+                <div hx-ws:connect="/ws/test">
+                    <button hx-ws:send hx-trigger="click">Send</button>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let button = container.querySelector('button');
+            button.click();
+            await htmx.timeout(20);
+
+            let ws = mockWebSocketInstances[0];
+            let registry = htmx.ext.ws.getRegistry();
+            let conn = registry.get('/ws/test');
+            assert.equal(conn.pendingRequests.size, 1, 'Should have 1 pending request');
+
+            // Wait for TTL to expire
+            await htmx.timeout(100);
+
+            // Receive any message — should trigger cleanup
+            ws.simulateMessage({ type: 'ping' });
+            await htmx.timeout(20);
+
+            assert.equal(conn.pendingRequests.size, 0, 'Expired pending request should be cleaned up');
+        });
+
+        it('closeConnection aborts the AbortController', async function() {
+            let container = createProcessedHTML(`
+                <div id="outer">
+                    <div id="ws-host" hx-ws:connect="/ws/test">Content</div>
+                </div>
+            `);
+            await htmx.timeout(50);
+
+            let registry = htmx.ext.ws.getRegistry();
+            let conn = registry.get('/ws/test');
+            assert.isNotNull(conn, 'Connection should exist');
+            assert.isNotNull(conn.abortController, 'AbortController should exist');
+            let ac = conn.abortController;
+
+            // Remove the element to trigger closeConnection
+            await htmx.swap({
+                text: '',
+                target: document.getElementById('outer'),
+                swap: 'innerHTML'
+            });
+            await htmx.timeout(50);
+
+            assert.isTrue(ac.signal.aborted, 'AbortController should be aborted on close');
+        });
+    });
 });
